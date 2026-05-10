@@ -17,7 +17,7 @@ except ImportError:
 import bittensor as bt
 
 from poker44.base.miner import BaseMinerNeuron
-from poker44.miner_heuristics import get_chunk_scorer_startup_check, score_chunks_gen7heur10
+from poker44.miner_heuristics import get_chunk_scorer_startup_check, score_chunk_gen7heur9
 from poker44.utils.model_manifest import (
     build_local_model_manifest,
     evaluate_manifest_compliance,
@@ -62,6 +62,7 @@ class Miner(BaseMinerNeuron):
     def __init__(self, config=None):
         super(Miner, self).__init__(config=config)
         bt.logging.info("Heuristic Poker44 Miner started (gen10heur10)")
+        self.prediction_threshold = 0.5
 
         chunk_scorer = "gen10heur10"
         bt.logging.info("[init] POKER44_CHUNK_SCORER=gen10heur10 (hardcoded)")
@@ -119,6 +120,33 @@ class Miner(BaseMinerNeuron):
         self.manifest_digest = manifest_digest(self.model_manifest)
         self._log_manifest_startup(repo_root)
 
+    def _adapt_future_threshold(self, scores: List[float], predictions: List[bool]) -> None:
+        if not scores or not predictions:
+            return
+        if not all(pred == predictions[0] for pred in predictions):
+            return
+
+        old_threshold = self.prediction_threshold
+        if predictions[0]:
+            new_threshold = min(1.0, min(scores) + 1e-6)
+            reason = "all_true"
+        else:
+            new_threshold = max(0.0, max(scores))
+            reason = "all_false"
+
+        if abs(new_threshold - old_threshold) < 1e-9:
+            bt.logging.debug(
+                f"[threshold] uniform batch={reason}; keeping future threshold at {old_threshold:.6f}"
+            )
+            return
+
+        self.prediction_threshold = new_threshold
+        bt.logging.debug(
+            "[threshold] future threshold updated "
+            f"from {old_threshold:.6f} to {new_threshold:.6f} "
+            f"after {reason} batch; scores_min={min(scores):.6f} scores_max={max(scores):.6f}"
+        )
+
     def _log_manifest_startup(self, repo_root: Path) -> None:
         bt.logging.info(
             f"Miner transparency status: {self.manifest_compliance['status']} "
@@ -139,7 +167,13 @@ class Miner(BaseMinerNeuron):
     async def forward(self, synapse: DetectionSynapse) -> DetectionSynapse:
         chunks: List[List[dict]] = synapse.chunks or []
 
-        scores, routes, _rebalance_stats = score_chunks_gen7heur10(chunks)
+        scores = []
+        routes = []
+        threshold = self.prediction_threshold
+        for chunk in chunks:
+            score, _route = score_chunk_gen7heur9(chunk)
+            scores.append(float(score))
+            routes.append("gen10heur10")
 
         chunk_sizes = [len(chunk or []) for chunk in chunks]
 
@@ -153,7 +187,8 @@ class Miner(BaseMinerNeuron):
         bt.logging.debug(f"[miner] Received {len(chunks)} chunk(s); first sizes={_preview(chunk_sizes)}")
 
         synapse.risk_scores = scores
-        synapse.predictions = [s >= 0.5 for s in scores]
+        synapse.predictions = [s >= threshold for s in scores]
+        self._adapt_future_threshold(scores, synapse.predictions)
         synapse.model_manifest = dict(self.model_manifest)
 
         bt.logging.debug(
@@ -162,7 +197,7 @@ class Miner(BaseMinerNeuron):
         )
         bt.logging.debug(
             f"[miner] Responding with scores={_preview(scores)} "
-            f"routes={_preview(routes)} predictions={_preview(synapse.predictions)}"
+            f"routes={_preview(routes)} threshold={threshold:.6f} predictions={_preview(synapse.predictions)}"
         )
 
         source_hotkey = getattr(getattr(synapse, "dendrite", None), "hotkey", "unknown")
@@ -208,8 +243,8 @@ class Miner(BaseMinerNeuron):
         return allowed
 
     def score_chunk(self, chunk: list[dict]) -> float:
-        scores, _routes, _stats = score_chunks_gen7heur10([chunk])
-        return float(scores[0]) if scores else 0.5
+        score, _route = score_chunk_gen7heur9(chunk)
+        return float(score)
 
     async def blacklist(self, synapse: DetectionSynapse) -> Tuple[bool, str]:
         if synapse.dendrite is None or synapse.dendrite.hotkey is None:
