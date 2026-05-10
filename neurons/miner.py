@@ -4,6 +4,7 @@ import json
 import os
 import subprocess
 import time
+import hashlib
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Tuple
@@ -63,6 +64,7 @@ class Miner(BaseMinerNeuron):
         super(Miner, self).__init__(config=config)
         bt.logging.info("Heuristic Poker44 Miner started (gen10heur10)")
         self.prediction_threshold = 0.5
+        self._task_response_cache = {}
 
         chunk_scorer = "gen10heur10"
         bt.logging.info("[init] POKER44_CHUNK_SCORER=gen10heur10 (hardcoded)")
@@ -147,6 +149,11 @@ class Miner(BaseMinerNeuron):
             f"after {reason} batch; scores_min={min(scores):.6f} scores_max={max(scores):.6f}"
         )
 
+    @staticmethod
+    def _task_fingerprint(chunks: List[List[dict]]) -> str:
+        payload = json.dumps(chunks, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
     def _log_manifest_startup(self, repo_root: Path) -> None:
         bt.logging.info(
             f"Miner transparency status: {self.manifest_compliance['status']} "
@@ -166,14 +173,32 @@ class Miner(BaseMinerNeuron):
 
     async def forward(self, synapse: DetectionSynapse) -> DetectionSynapse:
         chunks: List[List[dict]] = synapse.chunks or []
+        task_fingerprint = self._task_fingerprint(chunks)
+        cached_response = self._task_response_cache.get(task_fingerprint)
 
-        scores = []
-        routes = []
-        threshold = self.prediction_threshold
-        for chunk in chunks:
-            score, _route = score_chunk_gen7heur9(chunk)
-            scores.append(float(score))
-            routes.append("gen10heur10")
+        if cached_response is not None:
+            scores = list(cached_response["scores"])
+            routes = list(cached_response["routes"])
+            predictions = list(cached_response["predictions"])
+            threshold = float(cached_response["threshold"])
+            cache_status = "hit"
+        else:
+            scores = []
+            routes = []
+            threshold = self.prediction_threshold
+            for chunk in chunks:
+                score, _route = score_chunk_gen7heur9(chunk)
+                scores.append(float(score))
+                routes.append("gen10heur10")
+            predictions = [s >= threshold for s in scores]
+            self._task_response_cache[task_fingerprint] = {
+                "scores": list(scores),
+                "routes": list(routes),
+                "predictions": list(predictions),
+                "threshold": threshold,
+            }
+            self._adapt_future_threshold(scores, predictions)
+            cache_status = "miss"
 
         chunk_sizes = [len(chunk or []) for chunk in chunks]
 
@@ -187,8 +212,7 @@ class Miner(BaseMinerNeuron):
         bt.logging.debug(f"[miner] Received {len(chunks)} chunk(s); first sizes={_preview(chunk_sizes)}")
 
         synapse.risk_scores = scores
-        synapse.predictions = [s >= threshold for s in scores]
-        self._adapt_future_threshold(scores, synapse.predictions)
+        synapse.predictions = predictions
         synapse.model_manifest = dict(self.model_manifest)
 
         bt.logging.debug(
@@ -197,7 +221,8 @@ class Miner(BaseMinerNeuron):
         )
         bt.logging.debug(
             f"[miner] Responding with scores={_preview(scores)} "
-            f"routes={_preview(routes)} threshold={threshold:.6f} predictions={_preview(synapse.predictions)}"
+            f"routes={_preview(routes)} threshold={threshold:.6f} cache={cache_status} "
+            f"predictions={_preview(synapse.predictions)}"
         )
 
         source_hotkey = getattr(getattr(synapse, "dendrite", None), "hotkey", "unknown")
